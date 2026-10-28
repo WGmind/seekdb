@@ -69,7 +69,8 @@ private:
   public:
     // for property and tmp json string
     mutable ObArenaAllocator allocator_;
-    ObString parser_name_;
+    ObString raw_parser_name_;  // parser name as written in the SQL, e.g. "ik"
+    ObString parser_name_;      // normalized parser name, e.g. "ik.1"
     ObString properties_;
     ObObjMeta meta_;
     ObString fulltext_;
@@ -85,6 +86,11 @@ private:
                          ObEvalCtx &ctx,
                          common::ObArenaAllocator &allocator,
                          TokenizeParam &param);
+
+  // Derives TokenizeParam::parser_name_ / properties_ from the SQL arguments.
+  // The derivation (string build + parser property JSON round trip) only
+  // depends on the arguments, so its result is cached per thread.
+  static int prepare_parser_setup(TokenizeParam &param);
 
   static int parse_fulltext(const ObExpr &expr, ObEvalCtx &ctx, TokenizeParam &param);
   static int parse_parser_name(const ObExpr &expr, ObEvalCtx &ctx, TokenizeParam &param);

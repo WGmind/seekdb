@@ -39,6 +39,90 @@ namespace oceanbase
 {
 namespace sql
 {
+
+namespace
+{
+// tokenize() derives a normalized parser name ("ik.1") and a canonical parser
+// property JSON from its SQL arguments on every evaluation.  Both derivations
+// are pure functions of the arguments (a string build plus a JSON
+// parse/rebuild/serialize round trip), so recomputing them for every row of a
+// scan - which is what the tokenize() benchmark does - is pure overhead on the
+// hot path.  Keep the last prepared pair in a per-thread cache and rebuild it
+// only when the arguments change.
+struct ObTokenizeSetupCache
+{
+  static const int64_t MAX_KEY_LEN = 512;
+  static const int64_t MAX_DERIVED_LEN = 1024;
+
+  bool valid_;
+  int64_t name_key_len_;
+  int64_t props_key_len_;
+  int64_t inner_name_len_;
+  int64_t props_out_len_;
+  char name_key_[MAX_KEY_LEN];
+  char props_key_[MAX_KEY_LEN];
+  char inner_name_[storage::OB_FT_PARSER_NAME_LENGTH];
+  char props_out_[MAX_DERIVED_LEN];
+
+  ObTokenizeSetupCache()
+    : valid_(false),
+      name_key_len_(0),
+      props_key_len_(0),
+      inner_name_len_(0),
+      props_out_len_(0)
+  {
+  }
+};
+
+ObTokenizeSetupCache &tokenize_setup_cache()
+{
+  static thread_local ObTokenizeSetupCache cache;
+  return cache;
+}
+
+// The parse helper owns an allocator that backs both the word strings and the
+// JSON result of one tokenize() call, and rebuilding it re-parses the parser
+// name / property JSON for every call.  Keep one prepared helper per thread
+// together with its scratch allocator (pages are recycled per call) and rebuild
+// it only when the parser or its properties change.
+struct ObTokenizeWorkCache
+{
+  ObArenaAllocator arena_;
+  storage::ObFTParseHelper helper_;
+  bool helper_inited_;
+  int64_t parser_name_len_;
+  int64_t properties_len_;
+  char parser_name_[storage::OB_FT_PARSER_NAME_LENGTH];
+  char properties_[ObTokenizeSetupCache::MAX_DERIVED_LEN];
+
+  ObTokenizeWorkCache()
+    : arena_(ObMemAttr("TokenizeWork")),
+      helper_(),
+      helper_inited_(false),
+      parser_name_len_(0),
+      properties_len_(0)
+  {
+  }
+
+  bool same_parser(const ObString &parser_name, const ObString &properties) const
+  {
+    return helper_inited_
+           && parser_name_len_ == parser_name.length()
+           && properties_len_ == properties.length()
+           && (0 == parser_name_len_
+               || 0 == MEMCMP(parser_name_, parser_name.ptr(), parser_name_len_))
+           && (0 == properties_len_
+               || 0 == MEMCMP(properties_, properties.ptr(), properties_len_));
+  }
+};
+
+ObTokenizeWorkCache &tokenize_work_cache()
+{
+  static thread_local ObTokenizeWorkCache cache;
+  return cache;
+}
+} // namespace
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -81,36 +165,62 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
                                       ObIJsonBase *&result)
 {
   int ret = OB_SUCCESS;
-  storage::ObFTParseHelper tokenize_helper;
+  ObTokenizeWorkCache &work = tokenize_work_cache();
   const int64_t ft_word_bkt_cnt = MIN(MAX(param.fulltext_.length() / 2, 2), 997);
   int64_t doc_len = 0;
+  // The word map is created per call with the bucket count derived from the
+  // text length, so the token order in the result stays identical to before.
   storage::ObFTWordMap token_map;
 
-  ObArenaAllocator tmp_parse_alloc(ObMemAttr("Tmp buffer"));
+  UNUSED(allocator);
 
   if (TokenizeParam::OUTPUT_MODE::DEFAULT != mode && TokenizeParam::OUTPUT_MODE::ALL != mode) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(tokenize_helper.init(&allocator, param.parser_name_, param.properties_))) {
+  } else if (!work.same_parser(param.parser_name_, param.properties_)) {
+    // the parser or its properties changed: rebuild the helper, and drop the
+    // scratch memory of the previous call (it is no longer referenced).
+    work.helper_.reset();
+    work.arena_.reset();
+    work.helper_inited_ = false;
+    if (OB_FAIL(work.helper_.init(&work.arena_, param.parser_name_, param.properties_))) {
+    } else {
+      if (param.parser_name_.length() < static_cast<int64_t>(sizeof(work.parser_name_))
+          && param.properties_.length() < static_cast<int64_t>(sizeof(work.properties_))) {
+        if (param.parser_name_.length() > 0) {
+          MEMCPY(work.parser_name_, param.parser_name_.ptr(), param.parser_name_.length());
+        }
+        work.parser_name_len_ = param.parser_name_.length();
+        if (param.properties_.length() > 0) {
+          MEMCPY(work.properties_, param.properties_.ptr(), param.properties_.length());
+        }
+        work.properties_len_ = param.properties_.length();
+        work.helper_inited_ = true;
+      }
+    }
+  } else {
+    // recycle the scratch memory (word strings, JSON result) of the last call
+    work.arena_.reuse();
+  }
+
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
-  } else if (
-      (0 != param.fulltext_.length())
-      && OB_FAIL(tokenize_helper.segment(
-                     param.meta_,
-                     param.fulltext_.ptr(),
-                     param.fulltext_.length(),
-                     doc_len,
-                     token_map))) {
+  } else if ((0 != param.fulltext_.length())
+             && OB_FAIL(work.helper_.segment(param.meta_,
+                                             param.fulltext_.ptr(),
+                                             param.fulltext_.length(),
+                                             doc_len,
+                                             token_map))) {
   } else {
     switch (param.output_mode_) {
     case TokenizeParam::OUTPUT_MODE::DEFAULT: {
-      if (OB_FAIL(tokenize_helper.make_token_array_json(token_map, result))) {
+      if (OB_FAIL(work.helper_.make_token_array_json(token_map, result))) {
       } else {
         // pass
       }
       break;
     }
     case TokenizeParam::OUTPUT_MODE::ALL: {
-      if (OB_FAIL(tokenize_helper.make_detail_json(token_map, doc_len, result))) {
+      if (OB_FAIL(work.helper_.make_detail_json(token_map, doc_len, result))) {
       } else {
         // pass
       }
@@ -125,6 +235,7 @@ int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,
 
 ObExprTokenize::TokenizeParam ::TokenizeParam()
   : allocator_(ObMemAttr("TokenizeParam")),
+    raw_parser_name_(ObString(OB_DEFAULT_FULLTEXT_PARSER_NAME)),
     parser_name_(ObString(OB_DEFAULT_FULLTEXT_PARSER_NAME)),
     meta_(),
     fulltext_(),
@@ -212,8 +323,54 @@ int ObExprTokenize::parse_param(const ObExpr &expr,
   } else if (OB_FAIL(parse_fulltext(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_name(expr, ctx, param))) {
   } else if (OB_FAIL(parse_parser_properties(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(param.reform_parser_properties(param.properties_))) {
+  } else if (OB_FAIL(prepare_parser_setup(param))) {
   } else if (OB_FAIL(param.try_load_dictionary_for_ik())) {
+  }
+  return ret;
+}
+
+int ObExprTokenize::prepare_parser_setup(TokenizeParam &param)
+{
+  int ret = OB_SUCCESS;
+  ObTokenizeSetupCache &cache = tokenize_setup_cache();
+  const ObString raw_name = param.raw_parser_name_;
+  const ObString raw_props = param.properties_;
+  const bool cacheable = raw_name.length() > 0
+                         && raw_name.length() <= ObTokenizeSetupCache::MAX_KEY_LEN
+                         && raw_props.length() <= ObTokenizeSetupCache::MAX_KEY_LEN;
+  const bool hit = cache.valid_
+                   && cacheable
+                   && cache.name_key_len_ == raw_name.length()
+                   && cache.props_key_len_ == raw_props.length()
+                   && 0 == MEMCMP(cache.name_key_, raw_name.ptr(), raw_name.length())
+                   && (0 == raw_props.length()
+                       || 0 == MEMCMP(cache.props_key_, raw_props.ptr(), raw_props.length()));
+  if (OB_LIKELY(hit)) {
+    param.parser_name_ = ObString(static_cast<int32_t>(cache.inner_name_len_), cache.inner_name_);
+    param.properties_ = ObString(static_cast<int32_t>(cache.props_out_len_), cache.props_out_);
+  } else {
+    // derive (and validate) the normalized parser name first, then the
+    // canonical properties, exactly as before.
+    if (OB_FAIL(construct_ft_parser_inner_name(raw_name, param))) {
+    } else if (OB_FAIL(param.reform_parser_properties(raw_props))) {
+    } else if (cacheable
+               && param.parser_name_.length() > 0
+               && param.parser_name_.length() < static_cast<int64_t>(sizeof(cache.inner_name_))
+               && param.properties_.length() < static_cast<int64_t>(sizeof(cache.props_out_))) {
+      MEMCPY(cache.name_key_, raw_name.ptr(), raw_name.length());
+      cache.name_key_len_ = raw_name.length();
+      if (raw_props.length() > 0) {
+        MEMCPY(cache.props_key_, raw_props.ptr(), raw_props.length());
+      }
+      cache.props_key_len_ = raw_props.length();
+      MEMCPY(cache.inner_name_, param.parser_name_.ptr(), param.parser_name_.length());
+      cache.inner_name_len_ = param.parser_name_.length();
+      if (param.properties_.length() > 0) {
+        MEMCPY(cache.props_out_, param.properties_.ptr(), param.properties_.length());
+      }
+      cache.props_out_len_ = param.properties_.length();
+      cache.valid_ = true;
+    }
   }
   return ret;
 }
@@ -333,7 +490,10 @@ int ObExprTokenize::parse_parser_name(const ObExpr &expr, ObEvalCtx &ctx, Tokeni
 
   if (OB_FAIL(ret)) {
     // already logged
-  } else if (OB_FAIL(construct_ft_parser_inner_name(raw_parser_name, param))) {
+  } else {
+    // the normalized parser name is derived from this in prepare_parser_setup(),
+    // where the derivation result can be cached per thread.
+    param.raw_parser_name_ = raw_parser_name;
   }
 
   return ret;
