@@ -1593,12 +1593,45 @@ bool ObAIFuncPromptObjectUtils::is_valid_prompt_object(ObJsonObject *prompt_obje
       ObJsonNode *node = args_array->get_value(i);
       if (OB_ISNULL(node)) {  
         is_valid = false;
-      } else if (node->json_type() != ObJsonNodeType::J_STRING && node->json_type() != ObJsonNodeType::J_OBJECT) {
-        is_valid = false;
       }
     }
   }
   return is_valid;
+}
+
+// Convert the prompt arguments into json strings so that the substitution below
+// only has to deal with strings. A json string keeps its raw value, while any
+// other json node (object/array/number/boolean/null) is serialized into its
+// json text, so the structure of a non-string argument survives substitution.
+static int convert_prompt_args_to_strings(ObIAllocator &allocator,
+                                          ObJsonArray *args_array,
+                                          ObJsonArray *&str_args_array)
+{
+  int ret = OB_SUCCESS;
+  ObJsonArray *new_args_array = NULL;
+  if (OB_ISNULL(args_array)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, new_args_array))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < args_array->element_count(); i++) {
+      ObJsonNode *arg_node = args_array->get_value(i);
+      ObJsonString *arg_str_node = NULL;
+      ObString arg_text;
+      if (OB_ISNULL(arg_node)) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (arg_node->json_type() == ObJsonNodeType::J_STRING) {
+        if (OB_FAIL(new_args_array->append(arg_node))) {
+        }
+      } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator, arg_node, arg_text))) {
+      } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(allocator, arg_text, arg_str_node))) {
+      } else if (OB_FAIL(new_args_array->append(arg_str_node))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    str_args_array = new_args_array;
+  }
+  return ret;
 }
 
 int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &allocator, ObJsonObject* prompt_object, ObString& replaced_prompt_str)
@@ -1606,6 +1639,7 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
   INIT_SUCC(ret);
   ObJsonString *template_json_str = NULL;
   ObJsonArray *args_array = NULL;
+  ObJsonArray *str_args_array = NULL;
   ObString template_str;
   ObString result_str;
   if (OB_ISNULL(prompt_object) ||
@@ -1614,19 +1648,27 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
       OB_ISNULL(template_str = template_json_str->get_str()) ||
       (template_str.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(convert_prompt_args_to_strings(allocator, args_array, str_args_array))) {
+  } else if (OB_FALSE_IT(args_array = str_args_array)) {
   } else {
     uint64_t args_count = args_array->element_count();
-    int64_t max_result_len = template_str.length();
+    int64_t max_arg_len = 0;
     char *result_buf = NULL;
     for (uint64_t i = 0; OB_SUCC(ret) && i < args_count; i++) {
       ObJsonNode *arg_node = args_array->get_value(i);
       if (OB_NOT_NULL(arg_node) && arg_node->json_type() == ObJsonNodeType::J_STRING) {
         ObJsonString *arg_str = static_cast<ObJsonString *>(arg_node);
-        max_result_len += arg_str->get_str().length();
+        if (arg_str->get_str().length() > max_arg_len) {
+          max_arg_len = arg_str->get_str().length();
+        }
       } else {
         ret = OB_INVALID_ARGUMENT;
       }
     }
+    // A placeholder occupies at least three characters ("{0}") and the same
+    // argument may be referenced by several placeholders, so the substituted
+    // result can be longer than the template plus every argument taken once.
+    int64_t max_result_len = template_str.length() + (template_str.length() / 3) * max_arg_len;
     if (OB_FAIL(ret)) {
     } else if (OB_ISNULL(result_buf = static_cast<char *>(allocator.alloc(max_result_len)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -1671,7 +1713,9 @@ int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &al
                 ObString arg_value = arg_str->get_str();
                 
                 if (result_pos + arg_value.length() <= max_result_len) {
-                  MEMCPY(result_buf + result_pos, arg_value.ptr(), arg_value.length());
+                  if (arg_value.length() > 0 && OB_NOT_NULL(arg_value.ptr())) {
+                    MEMCPY(result_buf + result_pos, arg_value.ptr(), arg_value.length());
+                  }
                   result_pos += arg_value.length();
                 } else {
                   ret = OB_BUF_NOT_ENOUGH;
