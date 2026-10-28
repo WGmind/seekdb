@@ -232,17 +232,57 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
     } else {
       ObJsonArray *data_array = static_cast<ObJsonArray *>(data_node);
       ObJsonNode *embedding_node = nullptr;
-      for (int64_t i = 0; OB_SUCC(ret) && i < data_array->element_count(); i++) {
+      const int64_t data_count = data_array->element_count();
+      ObArray<int64_t> indexes;
+      ObArray<ObJsonNode *> embeddings;
+      bool all_have_index = true;
+      for (int64_t i = 0; OB_SUCC(ret) && i < data_count; i++) {
+        ObJsonNode *index_node = NULL;
+        ObJsonNode *embedding = NULL;
         if (OB_ISNULL(embedding_node = data_array->get_value(i))) {
           ret = OB_INVALID_DATA;
         } else if (embedding_node->json_type() != ObJsonNodeType::J_OBJECT) {
           ret = OB_INVALID_DATA;
         } else {
           ObJsonObject *embedding_obj = static_cast<ObJsonObject *>(embedding_node);
-          ObJsonNode *embedding = embedding_obj->get_value("embedding");
+          index_node = embedding_obj->get_value("index");
+          embedding = embedding_obj->get_value("embedding");
           if (OB_ISNULL(embedding)) {
             ret = OB_INVALID_DATA;
-          } else if (OB_FAIL(result_array->append(embedding))) {
+          } else if (OB_ISNULL(index_node) ||
+                     index_node->json_type() != ObJsonNodeType::J_INT) {
+            all_have_index = false;
+            if (OB_FAIL(indexes.push_back(i))) {
+            } else if (OB_FAIL(embeddings.push_back(embedding))) {
+            }
+          } else if (OB_FAIL(indexes.push_back(
+                       static_cast<ObJsonInt *>(index_node)->value()))) {
+          } else if (OB_FAIL(embeddings.push_back(embedding))) {
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (all_have_index) {
+          // the server may answer the requested inputs out of order: restore the
+          // order the inputs were sent in by their index so that the caller can
+          // map the results back to the original rows positionally
+          for (int64_t want = 0; OB_SUCC(ret) && want < data_count; want++) {
+            bool found = false;
+            for (int64_t i = 0; !found && i < indexes.count(); i++) {
+              if (indexes.at(i) == want) {
+                found = true;
+                if (OB_FAIL(result_array->append(embeddings.at(i)))) {
+                }
+              }
+            }
+            if (OB_SUCC(ret) && !found) {
+              ret = OB_INVALID_DATA;
+            }
+          }
+        } else {
+          for (int64_t i = 0; OB_SUCC(ret) && i < embeddings.count(); i++) {
+            if (OB_FAIL(result_array->append(embeddings.at(i)))) {
+            }
           }
         }
       }

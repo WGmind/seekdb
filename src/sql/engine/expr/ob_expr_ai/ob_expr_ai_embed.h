@@ -37,6 +37,10 @@ public:
                                 int64_t param_num,
                                 common::ObExprTypeCtx &type_ctx) const override;
   static int eval_ai_embed(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res);
+  // Batch callback: merges the inputs of the whole batch into one request and
+  // writes the results back to the original rows (null inputs stay null).
+  static int eval_batch_ai_embed(const ObExpr &expr, ObEvalCtx &ctx,
+                                 const ObBitVector &skip, const int64_t batch_size);
   virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, 
                       const ObRawExpr &raw_expr,
                       ObExpr &rt_expr) const override;

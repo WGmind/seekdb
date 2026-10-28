@@ -220,6 +220,45 @@ def serve(port):
                         ],
                         "usage": {"prompt_tokens": 1, "total_tokens": 1},
                     }
+                    if "reverse-order" in user_text:
+                        # answer the inputs in reverse order, the "index" field
+                        # still tells the client where each vector belongs
+                        response["data"] = list(reversed(response["data"]))
+            elif path.endswith("/rerank"):
+                query = text_of(body.get("query"))
+                documents = body.get("documents") or []
+                if not isinstance(documents, list):
+                    documents = [documents]
+                scored = []
+                for pos, doc in enumerate(documents):
+                    doc_text = doc if isinstance(doc, str) else json.dumps(
+                        doc, ensure_ascii=False, sort_keys=True)
+                    if query and query.lower() in doc_text.lower():
+                        score = 1.0
+                    else:
+                        # deterministic, strictly decreasing with position
+                        score = 0.5 - 0.01 * pos
+                    scored.append((score, pos))
+                # descending score, stable on the original index
+                scored.sort(key=lambda item: (-item[0], item[1]))
+                if "reverse-results" in query:
+                    # exercise the client's index mapping: answer out of order
+                    scored = list(reversed(scored))
+                top_n = body.get("top_n")
+                if isinstance(top_n, int) and top_n > 0:
+                    scored = scored[:top_n]
+                response = {
+                    "id": "rerank-mock",
+                    "results": [
+                        {
+                            "index": pos,
+                            "relevance_score": float(score),
+                            "document": documents[pos],
+                        }
+                        for score, pos in scored
+                    ],
+                    "meta": {"tokens": {"input_tokens": 1, "output_tokens": 1}},
+                }
             elif path.endswith("/api/generate"):
                 content = chat_content(system_text, user_text)
                 response = {
