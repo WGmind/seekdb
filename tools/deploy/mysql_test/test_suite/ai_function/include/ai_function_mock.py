@@ -188,6 +188,9 @@ def serve(port):
                     dims = DEFAULT_DIM
                 if dims <= 0:
                     dims = DEFAULT_DIM
+                if "dim-mismatch" in user_text:
+                    # deliberately answer with a different dimension than asked
+                    dims = 4
                 inputs = body.get("input")
                 if not isinstance(inputs, list):
                     inputs = [inputs] if inputs is not None else [""]
